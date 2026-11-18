@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hologram Orb v2</title>
+<style>
+  :root { --bg:#000; --cyan:#35e8ff; --dim:#0e5560; --warn:#ff4fd8; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html, body { height:100%; background:var(--bg); overflow:hidden; font-family:"Segoe UI",system-ui,sans-serif; color:var(--cyan); }
+  canvas#scene, canvas#fx { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  canvas#fx { pointer-events:none; }
+  #cam { position:fixed; right:16px; bottom:16px; width:280px; aspect-ratio:16/9; border:1px solid var(--dim); background:#020a0c;
+         clip-path:polygon(0 0,calc(100% - 18px) 0,100% 18px,100% 100%,18px 100%,0 calc(100% - 18px)); }
+  #cam video, #cam canvas { position:absolute; inset:0; width:100%; height:100%; transform:scaleX(-1); }
+  #cam video { opacity:.4; }
+  #camInfo { position:absolute; left:8px; bottom:4px; font-size:11px; color:#7fdbe6; z-index:2; }
+  #hud { position:fixed; left:20px; top:18px; font-size:14px; line-height:1.7; text-shadow:0 0 8px var(--cyan); pointer-events:none; }
+  #hud span { color:#fff; }
+  #guide { position:fixed; left:20px; bottom:18px; font-size:13px; line-height:1.75; color:#7fdbe6; opacity:.85; pointer-events:none; }
+  #start { position:fixed; inset:0; display:grid; place-items:center; background:rgba(0,0,0,.9); z-index:5; text-align:center; }
+  #start button { font:inherit; font-size:18px; padding:14px 34px; color:var(--cyan); background:transparent; border:1px solid var(--cyan); cursor:pointer;
+                  clip-path:polygon(0 0,calc(100% - 14px) 0,100% 14px,100% 100%,14px 100%,0 calc(100% - 14px)); transition:background .15s,color .15s; }
+  #start button:hover, #start button:focus-visible { background:var(--cyan); color:#000; outline:none; }
+  #start p { margin-top:16px; color:#7fdbe6; font-size:14px; }
+  #err { color:var(--warn); max-width:420px; }
+  @media (max-width:700px){ #cam{width:160px} #guide{display:none} }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<canvas id="fx"></canvas>
+<div id="cam"><video id="video" playsinline muted></video><canvas id="lm"></canvas><div id="camInfo"></div></div>
+
+<div id="hud">
+  Mode: <span id="mode">waiting</span><br>
+  Hands: <span id="gest">none</span><br>
+  Shape: <span id="shapeName">sphere</span> · Tracking: <span id="fps">0</span> fps · Smooth: <span id="sm">1.0</span>x
+</div>
+
+<div id="guide">
+  Pinch: grab, move, push or pull for depth. Release to throw<br>
+  Two hands pinching: pull apart to scale, twist to roll<br>
+  Open palm swipe: spin<br>
+  Point (index up): orb follows your fingertip<br>
+  Peace sign: next shape · Three fingers: next color<br>
+  Fist: collapse to core<br>
+  Both palms open: energy field, spread to expand<br>
+  F fullscreen · H hide camera · C switch camera · B low-light boost · [ ] smoothness
+</div>
+
+<div id="start"><div>
+  <button id="go">Start camera</button>
+  <p>Runs locally. Video never leaves your computer.</p>
+  <p id="err"></p>
+</div></div>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const $ = id => document.getElementById(id);
+const TUNE = { s:1, maxDPR:1.5 }; // s = smoothness: higher = silkier but laggier. Live keys: [ and ]
+
+/* ---------- Scene ---------- */
+const renderer = new THREE.WebGLRenderer({ canvas:$("scene"), antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, TUNE.maxDPR));
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100); camera.position.z = 6;
+const TAN = Math.tan(THREE.MathUtils.degToRad(25));
+// critically damped spring: velocity stays continuous, so no snapping when you grab or release
+function damp3(cur, vel, tgt, st, dt) { const o = 2 / Math.max(st, .01), x = o * dt, e = 1 / (1 + x + .48*x*x + .235*x*x*x);
+  for (const a of ["x","y","z"]) { const ch = cur[a] - tgt[a], tmp = (vel[a] + o * ch) * dt; vel[a] = (vel[a] - o * tmp) * e; cur[a] = tgt[a] + (ch + tmp) * e; } }
+const tmpC = new THREE.Color(), WHITE = new THREE.Color(1,1,1);
+
+const add = o => ({ color:0x35e8ff, wireframe:true, transparent:true, opacity:o, blending:THREE.AdditiveBlending, depthWrite:false });
+const shapes = [
+  ["sphere",     () => new THREE.IcosahedronGeometry(1, 3)],
+  ["crystal",    () => new THREE.OctahedronGeometry(1.15, 1)],
+  ["dodeca",     () => new THREE.DodecahedronGeometry(1.1, 1)],
+  ["knot",       () => new THREE.TorusKnotGeometry(.8, .25, 140, 14)],
+  ["cube",       () => new THREE.BoxGeometry(1.5, 1.5, 1.5, 4, 4, 4)],
+];
+let shapeIdx = 0;
+const shapeGeos = shapes.map(([, f]) => f());
+const orb = new THREE.Group(); scene.add(orb);
+const shell = new THREE.Mesh(shapeGeos[0], new THREE.MeshBasicMaterial(add(.35)));
+const inner = new THREE.Mesh(new THREE.IcosahedronGeometry(.6, 1), new THREE.MeshBasicMaterial(add(.55)));
+const core  = new THREE.Mesh(new THREE.SphereGeometry(.16, 24, 24), new THREE.MeshBasicMaterial({ color:0xbaf8ff, transparent:true, opacity:.9, blending:THREE.AdditiveBlending }));
+orb.add(shell, inner, core);
+
+const N = 800, pp = new Float32Array(N * 3);
+for (let i = 0; i < N; i++) { const r = 1.1 + Math.random() * .5, t = Math.random() * 6.283, p = Math.acos(2 * Math.random() - 1);
+  pp.set([r*Math.sin(p)*Math.cos(t), r*Math.sin(p)*Math.sin(t), r*Math.cos(p)], i * 3); }
+const pg = new THREE.BufferGeometry(); pg.setAttribute("position", new THREE.BufferAttribute(pp, 3));
+const points = new THREE.Points(pg, new THREE.PointsMaterial({ color:0x7ff3ff, size:.025, transparent:true, opacity:.8, blending:THREE.AdditiveBlending, depthWrite:false }));
+orb.add(points);
+const rings = [0,1,2].map(i => { const m = new THREE.Mesh(new THREE.TorusGeometry(1.4 + i*.12, .004, 8, 160), new THREE.MeshBasicMaterial({ color:0x35e8ff, transparent:true, opacity:.55, blending:THREE.AdditiveBlending }));
+  m.rotation.set(Math.random()*3, Math.random()*3, 0); orb.add(m); return m; });
+const grid = new THREE.GridHelper(14, 28, 0x0e5560, 0x06252b); grid.position.y = -2.8; grid.material.transparent = true; grid.material.opacity = .5; scene.add(grid);
+
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener("resize", resize); resize();
+
+/* ---------- Smoothing (One Euro filter) ---------- */
+function oneEuro(minCut = 1, beta = 10) {
+  let x = null, dx = 0, t0 = 0;
+  const a = (c, dt) => 1 / (1 + (1 / (2 * Math.PI * c)) / dt);
+  return (v, t) => { if (x === null) { x = v; t0 = t; return v; }
+    const dt = Math.max((t - t0) / 1000, 1e-3); t0 = t;
+    dx += a(1, dt) * ((v - x) / dt - dx); x += a(minCut / TUNE.s + beta * Math.abs(dx), dt) * (v - x); return x; };
+}
+const pt = () => { const fx = oneEuro(), fy = oneEuro(); return (p, t) => ({ x:fx(p.x, t), y:fy(p.y, t) }); };
+
+/* ---------- Gestures ---------- */
+const d2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const newHand = () => ({ pinch:false, cand:"none", n:0, g:"none", f:{ pinch:pt(), palm:pt(), tip:pt(), size:oneEuro(1, 2) }, prevPalm:null, prevT:0 });
+const store = {};
+function analyse(lm, st, t) {
+  const size = d2(lm[0], lm[9]) || .1;
+  const ratio = d2(lm[4], lm[8]) / size, reach = d2(lm[8], lm[0]) / size;
+  st.pinch = st.pinch ? ratio < .5 : (ratio < .32 && reach > 1.15);
+  const ext = [[8,6],[12,10],[16,14],[20,18]].map(([a, b]) => d2(lm[a], lm[0]) > d2(lm[b], lm[0]) * 1.08);
+  const n = ext.filter(Boolean).length;
+  let g = "none";
+  if (st.pinch) g = "pinch";
+  else if (n === 4) g = "open";
+  else if (n === 0) g = "fist";
+  else if (ext[0] && !ext[1] && !ext[2] && !ext[3]) g = "point";
+  else if (ext[0] && ext[1] && !ext[2] && !ext[3]) g = "peace";
+  else if (ext[0] && ext[1] && ext[2] && !ext[3]) g = "three";
+  if (g === st.cand) st.n++; else { st.cand = g; st.n = 1; }
+  if (st.n >= 3) st.g = st.cand;
+  const palm = st.f.palm({ x:(lm[0].x + lm[5].x + lm[17].x) / 3, y:(lm[0].y + lm[5].y + lm[17].y) / 3 }, t);
+  let v = { x:0, y:0 };
+  if (st.prevPalm) { const dt = Math.max((t - st.prevT) / 1000, 1e-3); v = { x:(palm.x - st.prevPalm.x) / dt, y:(palm.y - st.prevPalm.y) / dt }; }
+  st.prevPalm = palm; st.prevT = t;
+  return { g:st.g, palm, v, size:st.f.size(size, t),
+    pinch:st.f.pinch({ x:(lm[4].x + lm[8].x) / 2, y:(lm[4].y + lm[8].y) / 2 }, t), tip:st.f.tip(lm[8], t) };
+}
+
+/* ---------- State ---------- */
+const themes = [0x35e8ff, 0xff4fd8, 0xffd35a, 0x5dff9a, 0x9b7bff].map(c => new THREE.Color(c));
+let themeIdx = 0;
+const S = { pos:new THREE.Vector3(), vel:new THREE.Vector3(), target:new THREE.Vector3(), prev:new THREE.Vector3(),
+  scale:1, sv:0, tScale:1, detDt:.033, lastT:0, roll:0, rollT:0, collapse:0, tCollapse:0, field:0, tField:0, pulse:0, av:new THREE.Vector3(),
+  color:themes[0].clone(), mode:"idle", follow:0, prevAngle:0, lastShape:0, lastTheme:0, lastSeen:0 };
+let lastHands = [], seenAt = 0;
+const X = new THREE.Vector3(1,0,0), Y = new THREE.Vector3(0,1,0), Z = new THREE.Vector3(0,0,1);
+const zOf = size => THREE.MathUtils.clamp((size - .16) * 14, -2.5, 2.5);
+function toWorld(p, z) { const h = (6 - z) * TAN, w = h * camera.aspect; return new THREE.Vector3((.5 - p.x) * 2 * w, -(p.y - .5) * 2 * h, z); }
+
+function process(res, t) {
+  const seen = new Set(), hs = [];
+  res.landmarks.forEach((lm, i) => { let k = res.handedness[i]?.[0]?.categoryName || "H" + i; if (seen.has(k)) k += i; seen.add(k);
+    hs.push(analyse(lm, store[k] ||= newHand(), t)); });
+  for (const k in store) if (!seen.has(k)) delete store[k];
+  S.detDt = S.lastT ? Math.min((t - S.lastT) / 1000, .1) : .033; S.lastT = t;
+  lastHands = hs; seenAt = performance.now(); S.lastSeen = seenAt;
+
+  const pins = hs.filter(h => h.g === "pinch"), by = g => hs.find(h => h.g === g);
+  const prevMode = S.mode; S.follow = 0; S.tCollapse = 0; S.tField = 0;
+  if (pins.length === 2) {
+    const [a, b] = pins.map(h => toWorld(h.pinch, zOf(h.size))).sort((p, q) => p.x - q.x);
+    S.target.copy(a).add(b).multiplyScalar(.5); S.tScale = THREE.MathUtils.clamp(a.distanceTo(b) / 2.4, .35, 3.2);
+    const ang = Math.atan2(b.y - a.y, b.x - a.x);
+    if (prevMode === "scale") { let d = ang - S.prevAngle; d = Math.atan2(Math.sin(d), Math.cos(d)); S.rollT += d; }
+    S.prevAngle = ang; S.follow = .07; S.mode = "scale";
+  } else if (pins.length === 1) {
+    S.target.copy(toWorld(pins[0].pinch, zOf(pins[0].size))); S.follow = .07; S.mode = "grab";
+  } else if (by("fist")) { S.tCollapse = 1; S.mode = "core"; }
+  else if (by("point")) { const h = by("point"); S.target.copy(toWorld(h.tip, zOf(h.size))); S.follow = .16; S.mode = "follow"; }
+  else if (by("peace")) { S.mode = "shape"; if (t - S.lastShape > 1200) { S.lastShape = t; shapeIdx = (shapeIdx + 1) % shapes.length;
+      shell.geometry = shapeGeos[shapeIdx]; $("shapeName").textContent = shapes[shapeIdx][0]; S.pulse = 1; } }
+  else if (by("three")) { S.mode = "color"; if (t - S.lastTheme > 1200) { S.lastTheme = t; themeIdx = (themeIdx + 1) % themes.length; S.pulse = 1; } }
+  else if (hs.filter(h => h.g === "open").length === 2) { const [a, b] = hs;
+    S.target.copy(toWorld({ x:(a.palm.x + b.palm.x) / 2, y:(a.palm.y + b.palm.y) / 2 }, 0)); S.follow = .22;
+    S.tField = THREE.MathUtils.clamp(d2(a.palm, b.palm) * 2.2, 0, 1); S.mode = "field"; }
+  else if (by("open")) { const h = by("open"); S.av.y -= h.v.x * 1.8 * S.detDt; S.av.x += h.v.y * 1.8 * S.detDt; S.av.clampLength(0, 10); S.mode = "spin"; }
+  else S.mode = "idle";
+  if (S.mode !== "scale" && S.mode !== "grab") S.tScale += (1 - S.tScale) * .02;
+  $("mode").textContent = S.mode; $("gest").textContent = hs.map(h => h.g).join(" + ") || "none";
+}
+
+/* ---------- Camera ---------- */
+const video = $("video"), lm2 = $("lm"), lctx = lm2.getContext("2d");
+const oc = document.createElement("canvas"), octx = oc.getContext("2d");
+let landmarker, stream, devices = [], devIdx = 0, boost = false, lastTs = 0, frames = 0, fpsT = performance.now();
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+async function openCam(id) {
+  stream?.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ deviceId:id ? { exact:id } : undefined, width:{ ideal:960 }, height:{ ideal:540 }, frameRate:{ ideal:60 }, facingMode:"user" } });
+  video.srcObject = stream; await video.play();
+  const tr = stream.getVideoTracks()[0];
+  try { await tr.applyConstraints({ advanced:[{ focusMode:"continuous" }, { exposureMode:"continuous" }, { whiteBalanceMode:"continuous" }] }); } catch {}
+  $("cam").style.aspectRatio = video.videoWidth + "/" + video.videoHeight;
+  lm2.width = oc.width = video.videoWidth; lm2.height = oc.height = video.videoHeight;
+  $("camInfo").textContent = `${video.videoWidth}×${video.videoHeight} @ ${Math.round(tr.getSettings().frameRate || 0)}fps`;
+}
+
+function tick() {
+  let ts = performance.now(); if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
+  let src = video;
+  if (boost) { octx.filter = "brightness(1.35) contrast(1.15)"; octx.drawImage(video, 0, 0, oc.width, oc.height); src = oc; }
+  const res = landmarker.detectForVideo(src, ts);
+  lctx.clearRect(0, 0, lm2.width, lm2.height);
+  if (res.landmarks.length) {
+    lctx.strokeStyle = "#35e8ff"; lctx.fillStyle = "#fff"; lctx.lineWidth = 2;
+    for (const l of res.landmarks) { for (const [a, b] of CONN) { lctx.beginPath(); lctx.moveTo(l[a].x * lm2.width, l[a].y * lm2.height); lctx.lineTo(l[b].x * lm2.width, l[b].y * lm2.height); lctx.stroke(); }
+      for (const p of l) { lctx.beginPath(); lctx.arc(p.x * lm2.width, p.y * lm2.height, 2.5, 0, 6.283); lctx.fill(); } }
+    process(res, ts);
+  } else if (performance.now() - S.lastSeen > 250 && S.mode !== "idle") { S.mode = "idle"; S.follow = 0; S.tCollapse = 0; S.tField = 0; lastHands = []; for (const k in store) delete store[k]; $("mode").textContent = "idle"; $("gest").textContent = "none"; }
+  frames++; if (ts - fpsT > 1000) { $("fps").textContent = frames; frames = 0; fpsT = ts; }
+  video.requestVideoFrameCallback ? video.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+}
+
+/* ---------- Render ---------- */
+const fx = $("fx"), fctx = fx.getContext("2d"), clock = new THREE.Clock();
+function drawFx() {
+  const dpr = devicePixelRatio; if (fx.width !== Math.round(innerWidth * dpr)) { fx.width = Math.round(innerWidth * dpr); fx.height = Math.round(innerHeight * dpr); }
+  fctx.setTransform(dpr, 0, 0, dpr, 0, 0); fctx.clearRect(0, 0, innerWidth, innerHeight);
+  const age = performance.now() - seenAt; if (age > 400) return;
+  fctx.globalAlpha = 1 - age / 400; const css = "#" + S.color.getHexString();
+  fctx.strokeStyle = css; fctx.fillStyle = css; fctx.font = "12px Segoe UI, sans-serif"; fctx.lineWidth = 1.5;
+  for (const h of lastHands) { const p = h.g === "pinch" ? h.pinch : h.g === "point" ? h.tip : h.palm, x = (1 - p.x) * innerWidth, y = p.y * innerHeight;
+    fctx.beginPath(); fctx.arc(x, y, h.g === "pinch" ? 9 : 22, 0, 6.283); fctx.stroke(); fctx.fillText(h.g, x + 28, y + 4); }
+}
+
+function render() {
+  const dt = Math.min(clock.getDelta(), .05), t = clock.elapsedTime, k = 1 - Math.exp(-dt * 12);
+  // motion: follow hand with spring-like easing, otherwise coast with inertia and bounce at edges
+  if (S.follow > 0) damp3(S.pos, S.vel, S.target, S.follow * TUNE.s, dt);
+  else { S.pos.addScaledVector(S.vel, dt); S.vel.multiplyScalar(Math.exp(-dt * 1.5));
+    if (performance.now() - S.lastSeen > 2500) { S.vel.addScaledVector(S.pos, -dt * 1.2); S.tScale += (1 - S.tScale) * dt; }
+    const h = (6 - S.pos.z) * TAN * .9, w = h * camera.aspect;
+    if (Math.abs(S.pos.x) > w) { S.pos.x = Math.sign(S.pos.x) * w; S.vel.x *= -.7; }
+    if (Math.abs(S.pos.y) > h) { S.pos.y = Math.sign(S.pos.y) * h; S.vel.y *= -.7; } }
+  S.vel.clampLength(0, 25);
+  { const o = 2 / (.1 * TUNE.s), x = o * dt, e = 1 / (1 + x + .48*x*x + .235*x*x*x), ch = S.scale - S.tScale, tmp = (S.sv + o * ch) * dt; S.sv = (S.sv - o * tmp) * e; S.scale = S.tScale + (ch + tmp) * e; }
+  S.collapse += (S.tCollapse - S.collapse) * k; S.field += (S.tField - S.field) * k; S.pulse *= Math.exp(-dt * 4);
+
+  orb.position.copy(S.pos);
+  orb.scale.setScalar(S.scale * (1 - S.collapse * .55) * (1 + Math.sin(t * 2) * .015 + S.pulse * .25));
+  const dr = (S.rollT - S.roll) * k; S.roll += dr; orb.rotateOnWorldAxis(Z, dr);
+  orb.rotateOnWorldAxis(X, S.av.x * dt); orb.rotateOnWorldAxis(Y, S.av.y * dt + .25 * dt);
+  S.av.multiplyScalar(Math.exp(-dt * 1.8));
+
+  const gripped = S.mode === "grab" || S.mode === "scale";
+  S.color.lerp(tmpC.copy(themes[themeIdx]).lerp(WHITE, gripped ? .45 : S.collapse * .25), k);
+  for (const m of [shell, inner, points, ...rings]) m.material.color.copy(S.color);
+  shell.material.opacity = .35 + S.pulse * .5;
+  rings.forEach((r, i) => { r.rotation.z += .004 * (i + 1); r.visible = S.collapse < .5; });
+  inner.rotation.y -= .01; core.scale.setScalar(1 + S.collapse * 1.6 + Math.sin(t * 5) * .08);
+  points.scale.setScalar(1 + S.field * 1.8); points.material.opacity = .8 - S.collapse * .5;
+  renderer.render(scene, camera); drawFx(); requestAnimationFrame(render);
+}
+render();
+
+/* ---------- Start & keys ---------- */
+$("go").addEventListener("click", async () => {
+  $("err").textContent = "";
+  try {
+    $("mode").textContent = "loading model";
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(fs, { runningMode:"VIDEO", numHands:2, minHandDetectionConfidence:.6, minHandPresenceConfidence:.5, minTrackingConfidence:.5,
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" } });
+    await openCam();
+    devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    $("start").style.display = "none"; $("mode").textContent = "idle"; tick();
+  } catch (e) { $("err").textContent = "Could not start: " + (e.message || e) + ". Check camera permission and internet (model loads from a CDN)."; }
+});
+addEventListener("keydown", async e => {
+  const k = e.key.toLowerCase();
+  if (k === "f") document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  if (k === "h") { const c = $("cam"); c.style.display = c.style.display === "none" ? "" : "none"; }
+  if (k === "b") { boost = !boost; $("camInfo").textContent += boost ? " · boost on" : " · boost off"; }
+  if (k === "[" || k === "]") { TUNE.s = THREE.MathUtils.clamp(TUNE.s + (k === "]" ? .25 : -.25), .5, 3); $("sm").textContent = TUNE.s.toFixed(2); }
+  if (k === "c" && devices.length > 1) { devIdx = (devIdx + 1) % devices.length; try { await openCam(devices[devIdx].deviceId); } catch {} }
+});
+</script>
+</body>
+</html>
